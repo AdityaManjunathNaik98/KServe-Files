@@ -1,0 +1,76 @@
+name: Upload to MinIO-9
+description: Upload config.properties and mpqe.mar files to MinIO bucket with specific directory structure
+inputs:
+- {name: Config File}  # config.properties file path
+- {name: Model File}   # mpqe.mar file path  
+- {name: MinIO bucket name, type: String}  # MinIO bucket name
+- {name: Application name, type: String}  # Application name to include in the path
+- {name: MinIO username, type: String}  # MinIO username
+- {name: MinIO password, type: String}  # MinIO password
+outputs:
+- {name: MinIO path, type: String}  # Output MinIO path
+metadata:
+  annotations:
+    author: Aditya <manjunathnaik.a@mobiusdtaas.ai>
+implementation:
+    container:
+        image: ubuntu:22.04
+        command:
+        - sh
+        - -ex
+        - -c
+        - |
+            apt-get -o Acquire::ForceIPv4=true update
+            apt-get -o Acquire::ForceIPv4=true install -y wget
+            wget https://dl.min.io/client/mc/release/linux-amd64/mc
+            chmod +x mc
+            mv mc /usr/local/bin/
+            mc alias set myminio http://minio-service.kubeflow.svc.cluster.local:9000 "$4" "$5"
+            
+            if ! mc ls myminio/"$2"; then
+              mc mb myminio/"$2"
+            fi
+            
+            # Find the actual config file
+            CONFIG_FILE="$0/config.properties"
+            if [ ! -f "$CONFIG_FILE" ]; then
+                CONFIG_FILE="$0"
+            fi
+            
+            # Find the actual model file  
+            MODEL_FILE="$1/mpqe.mar"
+            if [ ! -f "$MODEL_FILE" ]; then
+                MODEL_FILE="$1"
+            fi
+            
+            echo "Looking for config at: $CONFIG_FILE"
+            echo "Looking for model at: $MODEL_FILE"
+            
+            if [ -f "$CONFIG_FILE" ]; then
+              mc cp "$CONFIG_FILE" "myminio/$2/$3/config/config.properties"
+              echo "Uploaded config.properties"
+            else
+              echo "Config file not found"
+              ls -la "$0" || echo "Config directory doesn't exist"
+              exit 1
+            fi
+            
+            if [ -f "$MODEL_FILE" ]; then
+              mc cp "$MODEL_FILE" "myminio/$2/$3/model-store/mpqe.mar"
+              echo "Uploaded mpqe.mar"
+            else
+              echo "Model file not found"
+              ls -la "$1" || echo "Model directory doesn't exist"
+              exit 1
+            fi
+            
+            mkdir -p "$(dirname "$6")"
+            echo "s3://$2/$3/" > "$6"
+            echo "Upload completed successfully!"
+        - inputPath: Config File
+        - inputPath: Model File
+        - inputValue: MinIO bucket name
+        - inputValue: Application name
+        - inputValue: MinIO username
+        - inputValue: MinIO password
+        - outputPath: MinIO path
