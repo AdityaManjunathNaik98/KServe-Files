@@ -3,184 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch_scatter import scatter_add, scatter_max, scatter_mean
-from torch_geometric.nn.conv import MessagePassing
-from torch.nn import Parameter as Param
-from torch_geometric.nn import inits
-from ..utils.data_utils import *
-from ..utils.mpqeutils import *
+from data_utils import *
+from mpqeutils import *
 from typing import Dict, Any
 
-from .base import BaseGNN
+from base import BaseGNN
+from mpqeutils import margin_loss
+
 
 # Import loss functions from utils
-from ..utils.mpqeutils import margin_loss
-
-
-class MLPReadout(nn.Module):
-    def __init__(self, input_dim, output_dim, scatter_fn):
-        super(MLPReadout, self).__init__()
-        self.layers = nn.Sequential(nn.Linear(in_features=input_dim,
-                                              out_features=output_dim),
-                                    nn.ReLU(),
-                                    nn.Linear(in_features=output_dim,
-                                              out_features=output_dim))
-        self.scatter_fn = scatter_fn
-
-    def forward(self, embs, batch_idx, **kwargs):
-        x = self.layers(embs)
-        x = self.scatter_fn(x, batch_idx, dim=0)
-
-        # If scatter_fn is max or min, values and indices are returned
-        if isinstance(x, tuple):
-            x = x[0]
-
-        return x
-
-
-class TargetMLPReadout(nn.Module):
-    def __init__(self, dim, scatter_fn):
-        super(TargetMLPReadout, self).__init__()
-        self.layers = nn.Sequential(nn.Linear(in_features=2*dim,
-                                              out_features=dim),
-                                    nn.ReLU(),
-                                    nn.Linear(in_features=dim,
-                                              out_features=dim))
-        self.scatter_fn = scatter_fn
-
-    def forward(self, embs, batch_idx, batch_size, num_nodes, num_anchors,
-                **kwargs):
-        device = embs.device
-
-        non_target_idx = torch.ones(num_nodes, dtype=torch.bool)
-        non_target_idx[num_anchors] = 0
-        non_target_idx.to(device)
-
-        batch_idx = batch_idx.reshape(batch_size, -1)
-        batch_idx = batch_idx[:, non_target_idx].reshape(-1)
-
-        embs = embs.reshape(batch_size, num_nodes, -1)
-        non_targets = embs[:, non_target_idx]
-        targets = embs[:, ~non_target_idx].expand_as(non_targets)
-
-        x = torch.cat((targets, non_targets), dim=-1)
-        x = x.reshape(batch_size * (num_nodes - 1), -1).contiguous()
-
-        x = self.layers(x)
-        x = self.scatter_fn(x, batch_idx, dim=0)
-
-        # If scatter_fn is max or min, values and indices are returned
-        if isinstance(x, tuple):
-            x = x[0]
-
-        return x
-
-
-class RGCNConv(MessagePassing):
-    r"""The relational graph convolutional operator from the `"Modeling
-    Relational Data with Graph Convolutional Networks"
-    <https://arxiv.org/abs/1703.06103>`_ paper
-
-    .. math::
-        \mathbf{x}^{\prime}_i = \mathbf{\Theta}_0 \cdot \mathbf{x}_i +
-        \sum_{r \in \mathcal{R}} \sum_{j \in \mathcal{N}_r(i)}
-        \frac{1}{|\mathcal{N}_r(i)|} \mathbf{\Theta}_r \cdot \mathbf{x}_j,
-
-    where :math:`\mathcal{R}` denotes the set of relations, *i.e.* edge types.
-    Edge type needs to be a one-dimensional :obj:`torch.long` tensor which
-    stores a relation identifier
-    :math:`\in \{ 0, \ldots, |\mathcal{R}| - 1\}` for each edge.
-
-    Args:
-        in_channels (int): Size of each input sample.
-        out_channels (int): Size of each output sample.
-        num_relations (int): Number of relations.
-        num_bases (int): Number of bases used for basis-decomposition.
-        bias (bool, optional): If set to :obj:`False`, the layer will not learn
-            an additive bias. (default: :obj:`True`)
-    """
-
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 num_relations,
-                 num_bases,
-                 bias=True):
-        super(RGCNConv, self).__init__('add')
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.num_relations = num_relations
-        self.num_bases = num_bases
-
-        if num_bases == 0:
-            self.basis = Param(torch.Tensor(num_relations, in_channels, out_channels))
-            self.att = None
-        else:
-            self.basis = Param(torch.Tensor(num_bases, in_channels, out_channels))
-            self.att = Param(torch.Tensor(num_relations, num_bases))
-        self.root = Param(torch.Tensor(in_channels, out_channels))
-
-        if bias:
-            self.bias = Param(torch.Tensor(out_channels))
-        else:
-            self.register_parameter('bias', None)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        if self.att is None:
-            size = self.num_relations * self.in_channels
-        else:
-            size = self.num_bases * self.in_channels
-            inits.uniform(size, self.att)
-
-        inits.uniform(size, self.basis)
-        inits.uniform(size, self.root)
-        inits.uniform(size, self.bias)
-
-    def forward(self, x, edge_index, edge_type, edge_norm=None):
-        """"""
-        if x is None:
-            x = torch.arange(
-                edge_index.max().item() + 1,
-                dtype=torch.long,
-                device=edge_index.device)
-
-        return self.propagate(
-            edge_index, x=x, edge_type=edge_type, edge_norm=edge_norm)
-
-    def message(self, x_j, edge_type, edge_norm):
-        if self.att is None:
-            w = self.basis.view(self.num_relations, -1)
-        else:
-            w = torch.matmul(self.att, self.basis.view(self.num_bases, -1))
-
-        if x_j.dtype == torch.long:
-            w = w.view(-1, self.out_channels)
-            index = edge_type * self.in_channels + x_j
-            out = torch.index_select(w, 0, index)
-            return out if edge_norm is None else out * edge_norm.view(-1, 1)
-        else:
-            w = w.view(self.num_relations, self.in_channels, self.out_channels)
-            w = torch.index_select(w, 0, edge_type)
-            out = torch.bmm(x_j.unsqueeze(1), w).squeeze(-2)
-            return out if edge_norm is None else out * edge_norm.view(-1, 1)
-
-    def update(self, aggr_out, x):
-        if x.dtype == torch.long:
-            out = aggr_out + self.root
-        else:
-            out = aggr_out + torch.matmul(x, self.root)
-
-        if self.bias is not None:
-            out = out + self.bias
-        return out
-
-    def __repr__(self):
-        return '{}({}, {}, num_relations={})'.format(
-            self.__class__.__name__, self.in_channels, self.out_channels,
-            self.num_relations)
-
 
 class RGCNEncoderDecoder(BaseGNN):
     """
@@ -413,7 +244,7 @@ class RGCNEncoderDecoder(BaseGNN):
             raise ValueError("Graph and encoder must be set before running queries. Call set_graph_and_encoder() first.")
             
         if anchor_ids is None or var_ids is None or q_graphs is None:
-            from utils.data_utils import RGCNQueryDataset
+            from data_utils import RGCNQueryDataset
             query_data = RGCNQueryDataset.get_query_graph(formula, queries,
                                                           self.rel_ids,
                                                           self.mode_ids)
@@ -435,7 +266,7 @@ class RGCNEncoderDecoder(BaseGNN):
         q_graphs.x = x
 
         if self.adaptive:
-            from utils.data_utils import RGCNQueryDataset
+            from data_utils import RGCNQueryDataset
             num_passes = RGCNQueryDataset.query_diameters[formula.query_type]
             if num_passes > len(self.layers):
                 raise ValueError(f'RGCN is adaptive with {len(self.layers)}'
@@ -497,63 +328,16 @@ class RGCNEncoderDecoder(BaseGNN):
         batch = next(queries_iterator)
         return self.compute_loss(*batch, hard_negatives=hard_negatives)
 
-    # def train_step(self, data, mask=None):
-    #     """
-    #     Single training step for RGCN query reasoning.
-
-    #     Args:
-    #         data: Should contain train_queries, current_iteration, and other training state
-    #         mask: Not used for RGCN, kept for interface compatibility
-
-    #     Returns:
-    #         Average loss for this step
-    #     """
-    #     if self.graph is None or self.enc is None:
-    #         raise ValueError("Graph and encoder must be set before training. "
-    #                         "Call set_graph_and_encoder() first.")
-            
-    #     self.train()
-
-    #     # Extract training data
-    #     train_queries = data.train_queries
-    #     batch_size = getattr(data, 'batch_size', self.batch_size)
-
-    #     # Always rebuild iterators fresh for this step
-    #     self.train_iterators = {}
-    #     for query_type, queries in train_queries.items():
-    #         if queries:  # only build if queries exist for this type
-    #             self.train_iterators[query_type] = get_queries_iterator(queries, batch_size, self)
-
-    #     self.optimizer.zero_grad()
-
-    #     # Always train on 1-chain if available
-    #     if "1-chain" not in self.train_iterators:
-    #         raise ValueError("No 1-chain queries found — training requires at least 1-chain queries.")
-    #     loss = self._run_batch_with_new_loss(self.train_iterators["1-chain"])
-
-    #     # If past burn-in, add other query types
-    #     if getattr(data, "past_burn_in", False):
-    #         for query_type in train_queries:
-    #             if query_type == "1-chain":
-    #                 continue
-    #             if query_type not in self.train_iterators:
-    #                 continue  # skip missing query types safely
-
-    #             if "inter" in query_type:
-    #                 loss += self.inter_weight * self._run_batch_with_new_loss(self.train_iterators[query_type])
-    #                 loss += self.inter_weight * self._run_batch_with_new_loss(
-    #                     self.train_iterators[query_type], hard_negatives=True
-    #                 )
-    #             else:
-    #                 loss += self.path_weight * self._run_batch_with_new_loss(self.train_iterators[query_type])
-
-    #     loss.backward()
-    #     self.optimizer.step()
-
-    #     return loss.item()
     def train_step(self, data, mask=None):
         """
         Single training step for RGCN query reasoning.
+
+        Args:
+            data: Should contain train_queries, current_iteration, and other training state
+            mask: Not used for RGCN, kept for interface compatibility
+
+        Returns:
+            Average loss for this step
         """
         if self.graph is None or self.enc is None:
             raise ValueError("Graph and encoder must be set before training. "
@@ -564,26 +348,18 @@ class RGCNEncoderDecoder(BaseGNN):
         # Extract training data
         train_queries = data.train_queries
         batch_size = getattr(data, 'batch_size', self.batch_size)
-        current_iter = getattr(data, 'current_iteration', 0)
 
-        # BUILD ITERATORS ONLY ONCE (not every step!)
-        if not hasattr(self, 'train_iterators') or not self.train_iterators:
-            self.train_iterators = {}
-            for query_type, queries in train_queries.items():
-                if queries:
-                    self.train_iterators[query_type] = get_queries_iterator(queries, batch_size, self)
-            self.current_iter = 0
-        
-        # Track which iteration we're on
-        self.current_iter = current_iter
+        # Always rebuild iterators fresh for this step
+        self.train_iterators = {}
+        for query_type, queries in train_queries.items():
+            if queries:  # only build if queries exist for this type
+                self.train_iterators[query_type] = get_queries_iterator(queries, batch_size, self)
 
         self.optimizer.zero_grad()
 
         # Always train on 1-chain if available
         if "1-chain" not in self.train_iterators:
-            raise ValueError("No 1-chain queries found – training requires at least 1-chain queries.")
-        
-        # Sample a batch (iterator cycles through data)
+            raise ValueError("No 1-chain queries found — training requires at least 1-chain queries.")
         loss = self._run_batch_with_new_loss(self.train_iterators["1-chain"])
 
         # If past burn-in, add other query types
@@ -592,7 +368,7 @@ class RGCNEncoderDecoder(BaseGNN):
                 if query_type == "1-chain":
                     continue
                 if query_type not in self.train_iterators:
-                    continue
+                    continue  # skip missing query types safely
 
                 if "inter" in query_type:
                     loss += self.inter_weight * self._run_batch_with_new_loss(self.train_iterators[query_type])
